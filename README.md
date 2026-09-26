@@ -25,6 +25,10 @@
 矩阵、正整数基数 **base** 与目标行列合计，把每格舍入到原值向下或向上的
 **base** 倍数（整倍数保持原值），使舍入后行列合计精确等于目标值，
 并在所有可行方案中最小化逐格绝对改变量之和，降低公开表格的精度。
+以及**观测计数交叉表阈值隐藏**：给定 2～4 行、2～4 列的正整数计数矩阵
+与正整数阈值，把低于阈值的格（必须隐藏格）隐藏后公开表格与原始行列
+合计；为避免从合计反推出这些格，再补充**数量最少**的隐藏格，使每个
+必须隐藏格都落在全部隐藏格构成的行列二部图的**环**上。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -44,6 +48,7 @@ docker compose up --build
 - 时空联合匿名发布接口：`POST http://localhost:8000/api/v1/spacetime-anonymize`
 - 公开格区域计数上下界接口：`POST http://localhost:8000/api/v1/geo-count-bounds`
 - 观测计数交叉表受控舍入接口：`POST http://localhost:8000/api/v1/round-count-table`
+- 观测计数交叉表阈值隐藏接口：`POST http://localhost:8000/api/v1/suppress-count-table`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -773,6 +778,93 @@ curl -s http://localhost:8000/api/v1/round-count-table \
 - `row_totals` 与 `column_totals` 的总和不相等；
 - 不存在可行解：某行/列的目标合计超出“全部向下舍入 ～ 全部向上舍入”
   的范围，或单侧合计虽在范围内但行列约束无法同时满足；
+- 请求体缺少必填字段或出现未声明字段。
+
+## 观测计数交叉表阈值隐藏
+
+`POST /api/v1/suppress-count-table`，`Content-Type: application/json`。
+
+小型的“物种 × 保护站”交叉计数表中，低于阈值的格往往对应需要保护的
+罕见观测，发布前必须隐藏。但只隐藏这些格并公开行列合计并不安全：
+某行（列）只剩一个隐藏格时，该格等于合计减去其余可见格之和，可以被
+逐一反推。本接口在隐藏所有低于阈值的格（**必须隐藏格**）之外，再从
+其余格中选出**数量最少**的补充隐藏格一并隐藏，使每个必须隐藏格都落在
+“全部隐藏格构成的行 × 列二部图”的某个**环**上——环上的边无法被行列
+合计唯一确定（沿环交替加减同一未知量仍满足全部合计），从而阻断反推。
+数量相同的可行方案不止一个时，按补充格**行优先坐标序列的字典序**取
+最小方案。
+
+### 请求格式
+
+```json
+{
+  "counts": [
+    [12, 7, 5],
+    [3, 9, 8],
+    [6, 11, 4]
+  ],
+  "threshold": 5
+}
+```
+
+- `counts`：正整数矩阵，**2～4 行、2～4 列**，所有行等长。
+- `threshold`：**正整数**隐藏阈值；计数**低于**该值的格必须隐藏
+  （等于阈值的格不隐藏）。
+
+### 响应格式
+
+上例中 `(1,0)=3` 与 `(2,2)=4` 低于阈值必须隐藏；二者与补充格
+`(1,2)`、`(2,0)` 构成 4 环（第 1、2 行 × 第 0、2 列），任一必须
+隐藏格都无法由合计唯一反推：
+
+```json
+{
+  "suppressed_counts": [
+    [12, 7, 5],
+    [null, 9, null],
+    [null, 11, null]
+  ],
+  "row_totals": [24, 20, 21],
+  "column_totals": [21, 27, 17],
+  "threshold": 5,
+  "mandatory_cells": [
+    {"row": 1, "column": 0},
+    {"row": 2, "column": 2}
+  ],
+  "supplementary_cells": [
+    {"row": 1, "column": 2},
+    {"row": 2, "column": 0}
+  ]
+}
+```
+
+- `suppressed_counts`：可公开发布的表格（与输入同形），隐藏格为
+  `null`，其余格为原始计数。
+- `row_totals` / `column_totals`：**原始**矩阵的行合计与列合计。
+- `threshold`：回显请求的隐藏阈值。
+- `mandatory_cells`：必须隐藏格（计数低于阈值的格）的零起始
+  `row`/`column` 坐标，按行优先排序。
+- `supplementary_cells`：补充隐藏格的零起始 `row`/`column` 坐标，
+  按行优先排序；数量为所有可行方案中的最小值，同数量时为行优先
+  坐标序列字典序最小方案。没有必须隐藏格时，两个列表都为空。
+
+仓库内 `examples/request-suppress-count-table.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/suppress-count-table \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-suppress-count-table.json
+```
+
+### 阈值隐藏接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `counts` 不是数组、行数不在 2～4、某一行不是数组、列数不在 2～4，
+  或各行长度不一致；
+- 某格计数不是正整数（含 `0`、负数、布尔值、浮点、字符串）；
+- `threshold` 不是正整数（含 `0`、负数、布尔值、非整数）；
 - 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误

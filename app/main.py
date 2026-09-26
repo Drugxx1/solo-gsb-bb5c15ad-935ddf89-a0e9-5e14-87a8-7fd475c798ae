@@ -22,6 +22,7 @@ from .geo_bounds import count_bounds, prepare_bounds, prepare_cells
 from .intersection import audit_intersections
 from .round_table import prepare_counts, prepare_totals, solve_rounding
 from .spacetime import assign_joint
+from .suppress_table import prepare_suppression_counts, solve_suppression
 from .time_windows import MAX_WINDOW_HOURS_LIMIT, assign_windows, prepare_records
 
 API_PREFIX = "/api/v1"
@@ -51,8 +52,12 @@ app = FastAPI(
         "另提供观测计数交叉表受控舍入：把 1～20 行、1～20 列的非负整数"
         "计数矩阵每格舍入到原值向下或向上的 base 倍数（整倍数保持原值），"
         "使舍入后行列合计精确等于指定的目标值，并最小化逐格绝对改变量之和。"
+        "另提供观测计数交叉表阈值隐藏：把 2～4 行、2～4 列的正整数计数矩阵中"
+        "低于阈值的格隐藏后，公开原始行列合计与隐藏后的表格，并补充数量最少"
+        "的隐藏格，使每个必须隐藏格都落在全部隐藏格构成的行列二部图的环上，"
+        "无法由合计反推。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -351,6 +356,41 @@ class RoundCountTableResponse(BaseModel):
     base: int
 
 
+class SuppressCountTableRequest(BaseModel):
+    """观测计数交叉表阈值隐藏请求体。"""
+
+    counts: list[list[Any]] = Field(
+        ..., description="2～4 行、2～4 列的正整数观测计数矩阵"
+    )
+    # 拒绝 bool 冒充整数；threshold 必须为正整数。
+    threshold: StrictInt = Field(
+        ..., description="隐藏阈值（正整数）：计数低于该值的格必须隐藏"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class HiddenCell(BaseModel):
+    """一个隐藏格的零起始行列坐标。"""
+
+    row: int
+    column: int
+
+
+class SuppressCountTableResponse(BaseModel):
+    """观测计数交叉表阈值隐藏结果。"""
+
+    # 可公开发布的表格：隐藏格为 None，其余格为原始计数。
+    suppressed_counts: list[list[int | None]]
+    # 原始矩阵的行列合计。
+    row_totals: list[int]
+    column_totals: list[int]
+    threshold: int
+    # 必须隐藏格（计数低于阈值）与补充隐藏格，均按行优先排序。
+    mandatory_cells: list[HiddenCell]
+    supplementary_cells: list[HiddenCell]
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """服务信息。"""
@@ -365,6 +405,7 @@ def root() -> dict[str, str]:
         "spacetime_anonymize": f"{API_PREFIX}/spacetime-anonymize",
         "geo_count_bounds": f"{API_PREFIX}/geo-count-bounds",
         "round_count_table": f"{API_PREFIX}/round-count-table",
+        "suppress_count_table": f"{API_PREFIX}/suppress-count-table",
     }
 
 
@@ -639,4 +680,40 @@ def round_count_table(request: RoundCountTableRequest) -> RoundCountTableRespons
         ],
         total_change=total_change,
         base=request.base,
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/suppress-count-table",
+    response_model=SuppressCountTableResponse,
+)
+def suppress_count_table(
+    request: SuppressCountTableRequest,
+) -> SuppressCountTableResponse:
+    """隐藏低于阈值的格，并补充最少隐藏格使必须隐藏格无法由合计反推。"""
+    if request.threshold < 1:
+        raise unprocessable("threshold 必须是正整数（>= 1）")
+
+    counts = prepare_suppression_counts(request.counts)
+    mandatory, supplementary = solve_suppression(counts, request.threshold)
+
+    hidden = set(mandatory) | set(supplementary)
+    rows = len(counts)
+    cols = len(counts[0])
+    suppressed = [
+        [None if (i, j) in hidden else counts[i][j] for j in range(cols)]
+        for i in range(rows)
+    ]
+
+    return SuppressCountTableResponse(
+        suppressed_counts=suppressed,
+        row_totals=[sum(row) for row in counts],
+        column_totals=[
+            sum(counts[i][j] for i in range(rows)) for j in range(cols)
+        ],
+        threshold=request.threshold,
+        mandatory_cells=[HiddenCell(row=i, column=j) for i, j in mandatory],
+        supplementary_cells=[
+            HiddenCell(row=i, column=j) for i, j in supplementary
+        ],
     )
